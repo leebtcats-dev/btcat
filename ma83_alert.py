@@ -41,6 +41,13 @@ STATE_DIR = os.environ.get("STATE_DIR", os.path.dirname(os.path.abspath(__file__
 # 东八区时区（用于消息时间显示）
 TZ_CN = timezone(timedelta(hours=8))
 
+# 免打扰时间段（东八区，左闭右开）：00:00 ~ 07:00 不推送
+QUIET_START = int(os.environ.get("QUIET_START_HOUR", "0"))
+QUIET_END = int(os.environ.get("QUIET_END_HOUR", "7"))
+
+# 同一周期两次推送的最小间隔（秒）：默认 1 小时
+MIN_PUSH_INTERVAL = int(os.environ.get("MIN_PUSH_INTERVAL", "3600"))
+
 # ---------------------------------------------------------------------------
 # 数据源抽象层：预留多数据源扩展
 # ---------------------------------------------------------------------------
@@ -143,6 +150,16 @@ def save_state(bar: str, state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def in_quiet_hours() -> bool:
+    """判断当前是否处于免打扰时间段（东八区）。"""
+    hour = datetime.now(TZ_CN).hour
+    if QUIET_START < QUIET_END:
+        # 正常区间，如 0~7
+        return QUIET_START <= hour < QUIET_END
+    # 跨午夜区间，如 22~6
+    return hour >= QUIET_START or hour < QUIET_END
+
+
 def push_wecom(text: str) -> bool:
     """推送文本消息到企业微信群机器人。"""
     if not WECOM_WEBHOOK:
@@ -207,19 +224,33 @@ def check_one_bar(source, bar: str) -> None:
     crossed = prev_side != last_side and last_side != 0
 
     # 状态更新（无论是否穿越都要写回当前 side）
-    save_state(
-        bar,
-        {
-            "side": last_side,
-            "ma": ma,
-            "price": last_close,
-            "ts": int(time.time()),
-        },
-    )
+    new_state = {
+        "side": last_side,
+        "ma": ma,
+        "price": last_close,
+        "ts": int(time.time()),
+    }
 
     if crossed:
         direction = "上穿" if last_side == 1 else "下穿"
         diff_pct = (last_close - ma) / ma * 100
+
+        # 免打扰检查：免打扰时间内不推送，但状态照常记录
+        if in_quiet_hours():
+            new_state["last_push_ts"] = state.get("last_push_ts", 0)
+            save_state(bar, new_state)
+            print(f"[{bar}] 穿越但处于免打扰时间(00:00-07:00)，跳过推送")
+            return
+
+        # 1 小时去重：距上次推送不足间隔则跳过
+        now_ts = int(time.time())
+        last_push = state.get("last_push_ts", 0)
+        if last_push and (now_ts - last_push) < MIN_PUSH_INTERVAL:
+            new_state["last_push_ts"] = last_push
+            save_state(bar, new_state)
+            print(f"[{bar}] 穿越但距上次推送不足 1 小时，跳过推送")
+            return
+
         now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
         text = (
             f"【BTC MA83 提醒】\n"
@@ -230,9 +261,13 @@ def check_one_bar(source, bar: str) -> None:
             f"时间: {now}"
         )
         print(f"[{bar}] ✅ 触发穿越：{direction}，推送中 ...")
-        push_wecom(text)
+        if push_wecom(text):
+            new_state["last_push_ts"] = now_ts
     else:
+        new_state["last_push_ts"] = state.get("last_push_ts", 0)
         print(f"[{bar}] 未穿越 (prev={prev_side}, last={last_side}, ma={ma:.2f})")
+
+    save_state(bar, new_state)
 
 
 def main() -> None:

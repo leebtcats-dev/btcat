@@ -66,12 +66,22 @@ Actions 页看到 workflow 自动按每 5 分钟触发即表示部署成功。
 | `INST_ID` | `BTC-USDT` | 监控标的 |
 | `MA_PERIOD` | `83` | 均线周期 |
 | `DATA_SOURCE` | `okx` | 数据源（预留 coinglass / coinmarketcap 扩展） |
+| `QUIET_START_HOUR` | `0` | 免打扰开始小时（东八区） |
+| `QUIET_END_HOUR` | `7` | 免打扰结束小时（东八区） |
+| `MIN_PUSH_INTERVAL` | `3600` | 同一周期两次推送最小间隔（秒，默认 1 小时） |
 
 ## 多数据源扩展
 
 脚本内置了数据源抽象层（`get_data_source()` / `fetch_candles()` 接口）。要接入
 Coinglass、CoinMarketCap 等平台，只需新增一个实现了 `fetch_candles(inst_id, bar, limit)`
 方法的数据源类，并在 `get_data_source()` 里注册即可，检测和推送逻辑无需改动。
+
+## 功能特性
+
+- **多周期监控**：同时监控 1H / 4H / 1D / 3D 四个周期的 MA83 穿越
+- **免打扰**：默认 00:00 ~ 07:00（东八区）不推送任何消息，可通过 `QUIET_START_HOUR` / `QUIET_END_HOUR` 调整
+- **去重防刷屏**：同一周期两次推送间隔至少 1 小时（可通过 `MIN_PUSH_INTERVAL` 调整）
+- **首次建基准**：首次运行只记录价格相对均线的位置，不推送，避免误报
 
 ## 注意事项
 
