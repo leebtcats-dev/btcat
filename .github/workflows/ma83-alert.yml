@@ -1,0 +1,50 @@
+name: BTC MA83 多周期穿越提醒
+
+on:
+  schedule:
+    # 每 5 分钟触发一次（UTC 时间，GitHub Actions 实际最小间隔约 5 分钟，会有几分钟延迟）
+    - cron: "*/5 * * * *"
+  # 支持手动触发（用于首次测试）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ma83-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install requests
+
+      - name: 恢复上次状态（缓存）
+        uses: actions/cache/restore@v4
+        id: cache-restore
+        with:
+          path: .state
+          key: ma83-state
+
+      - name: 运行 MA83 检测
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          STATE_DIR: ${{ github.workspace }}/.state
+        run: |
+          mkdir -p .state
+          python ma83_alert.py
+
+      - name: 保存状态（缓存）
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .state
+          key: ma83-state
