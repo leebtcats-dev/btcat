@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BTC MA83 多周期穿越提醒（云端版）
-================================
-纯 Python 直连 OKX 公共行情接口，监控 BTC-USDT 的 1H / 4H / 1D / 3D 四个周期，
-当收盘价穿越 MA(83) 均线时，通过企业微信群机器人 webhook 推送提醒。
+BTC MA83 多周期穿越提醒 + 确认信号（云端版）
+==========================================
+纯 Python 直连 OKX 公共行情接口，监控 BTC-USDT 的 1H / 4H / 1D / 3D 四个周期。
+
+两种提醒：
+1. 普通穿越 —— 收盘价穿越 MA(83) 均线时推送。
+2. 确认信号（重点）—— 穿越后的下一根已收线 K 线「整根完全不触及 MA83」时，
+   说明突破有效、假突破概率低，用醒目格式重点推送。
+   判定标准（最严格）：
+     · 上穿确认：该根 K 线最低价 > MA83（整根都在均线上方）
+     · 下穿确认：该根 K 线最高价 < MA83（整根都在均线下方）
 
 设计要点：
 1. 数据源可扩展 —— 默认用 OKX 公共 REST，预留 Coinglass / CoinMarketCap 接入框架。
-2. 状态持久化 —— 用本地状态文件记录每个周期"价格在 MA 上方还是下方"，
-   只在"穿越那一刻"推一次，避免同侧反复刷屏。
-3. 部署在 GitHub Actions（cron 每 5 分钟），电脑关机也照常运行。
+2. 只用「已收线」K 线做判定，避免未收线 K 线的价格变动导致误判。
+3. 状态持久化 —— 记录每周期的价格位置、待确认方向、上次推送时间。
+4. 免打扰 —— 00:00~07:00（东八区）不推送任何消息。
+5. 去重 —— 同一周期同类提醒间隔至少 1 小时。
+6. 部署在 GitHub Actions（cron 每 5 分钟），电脑关机也照常运行。
 
 依赖：仅需 requests（`pip install requests`）
 """
@@ -23,7 +32,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 # ---------------------------------------------------------------------------
-# 配置区（可通过 GitHub Secrets / 环境变量覆盖，均有默认值）
+# 配置区（可通过环境变量 / GitHub Secrets 覆盖）
 # ---------------------------------------------------------------------------
 
 # 企业微信群机器人 webhook（必须放 GitHub Secrets，变量名 WECOM_WEBHOOK）
@@ -45,7 +54,7 @@ TZ_CN = timezone(timedelta(hours=8))
 QUIET_START = int(os.environ.get("QUIET_START_HOUR", "0"))
 QUIET_END = int(os.environ.get("QUIET_END_HOUR", "7"))
 
-# 同一周期两次推送的最小间隔（秒）：默认 1 小时
+# 同一周期同类提醒的最小推送间隔（秒）：默认 1 小时
 MIN_PUSH_INTERVAL = int(os.environ.get("MIN_PUSH_INTERVAL", "3600"))
 
 # ---------------------------------------------------------------------------
@@ -59,7 +68,10 @@ class OkxSource:
     BASE = "https://www.okx.com/api/v5"
 
     def fetch_candles(self, inst_id: str, bar: str, limit: int = 120) -> list:
-        """拉 K 线，返回升序的 close 列表（最新在最后）。"""
+        """
+        拉 K 线，返回升序列表，每项为 dict:
+        {ts, o, h, l, c, confirm}  confirm=1 表示已收线，0 表示未收线
+        """
         resp = requests.get(
             f"{self.BASE}/market/candles",
             params={"instId": inst_id, "bar": bar, "limit": limit},
@@ -76,16 +88,19 @@ class OkxSource:
             raise RuntimeError("OKX 返回空数据")
 
         # OKX 返回降序（最新在前），每根格式 [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
-        # 转成升序的 (ts, close) 列表
-        candles = [(int(r[0]), float(r[4])) for r in rows]
-        candles.sort(key=lambda x: x[0])
+        candles = [
+            {
+                "ts": int(r[0]),
+                "o": float(r[1]),
+                "h": float(r[2]),
+                "l": float(r[3]),
+                "c": float(r[4]),
+                "confirm": r[8] == "1" if len(r) > 8 else True,
+            }
+            for r in rows
+        ]
+        candles.sort(key=lambda x: x["ts"])
         return candles
-
-
-# 未来扩展：Coinglass / CoinMarketCap 数据源只需实现相同的 fetch_candles 接口，
-# 然后在这里注册即可。
-# class CoinglassSource: ...
-# class CoinMarketCapSource: ...
 
 
 def get_data_source():
@@ -93,7 +108,6 @@ def get_data_source():
     name = os.environ.get("DATA_SOURCE", "okx").lower()
     if name == "okx":
         return OkxSource()
-    # 预留：elif name == "coinglass": return CoinglassSource()
     raise RuntimeError(f"未知数据源: {name}")
 
 
@@ -154,9 +168,7 @@ def in_quiet_hours() -> bool:
     """判断当前是否处于免打扰时间段（东八区）。"""
     hour = datetime.now(TZ_CN).hour
     if QUIET_START < QUIET_END:
-        # 正常区间，如 0~7
         return QUIET_START <= hour < QUIET_END
-    # 跨午夜区间，如 22~6
     return hour >= QUIET_START or hour < QUIET_END
 
 
@@ -181,97 +193,124 @@ def push_wecom(text: str) -> bool:
         return False
 
 
+def can_push(state: dict, push_key: str, now_ts: int) -> bool:
+    """免打扰 + 间隔去重判断。push_key 用于区分普通穿越与确认信号。"""
+    if in_quiet_hours():
+        return False
+    last = state.get(push_key, 0)
+    return not last or (now_ts - last) >= MIN_PUSH_INTERVAL
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
 
 def check_one_bar(source, bar: str) -> None:
-    """检查单个周期是否穿越 MA83，穿越则推送。"""
+    """检查单个周期：穿越提醒 + 确认信号提醒。"""
     print(f"[{bar}] 拉取 K 线 ...")
     candles = source.fetch_candles(INST_ID, bar, limit=120)
-    closes = [c for _, c in candles]
 
-    if len(closes) < 2:
-        print(f"[{bar}] 数据不足，跳过")
+    # 只使用已收线的 K 线做判定（未收线的最后一根价格仍在变动）
+    closed = [c for c in candles if c["confirm"]]
+    if len(closed) < MA_PERIOD + 2:
+        print(f"[{bar}] 已收线数据不足({len(closed)}根)，跳过")
         return
 
+    closes = [c["c"] for c in closed]
     ma = calc_ma(closes, MA_PERIOD)
-    prev_close = closes[-2]
-    last_close = closes[-1]
 
-    prev_side = side_of(prev_close, ma)
-    last_side = side_of(last_close, ma)
+    last = closed[-1]      # 最新已收线
+    prev = closed[-2]      # 上一根已收线
+
+    prev_side = side_of(prev["c"], ma)
+    last_side = side_of(last["c"], ma)
 
     state = load_state(bar)
-    last_recorded_side = state.get("side")  # None 表示首次运行
+    last_recorded_side = state.get("side")
+    pending = state.get("pending_confirm")  # 上一根发生穿越的方向，等待这一根确认
+    now_ts = int(time.time())
 
-    # 首次运行：只记录状态，不推送
-    if last_recorded_side is None:
-        save_state(
-            bar,
-            {
-                "side": last_side,
-                "ma": ma,
-                "price": last_close,
-                "ts": int(time.time()),
-            },
-        )
-        print(f"[{bar}] 首次运行，记录初始状态 side={last_side} (ma={ma:.2f}, price={last_close})")
-        return
-
-    # 穿越判定：最新一根相对上一根发生了跨越
-    crossed = prev_side != last_side and last_side != 0
-
-    # 状态更新（无论是否穿越都要写回当前 side）
     new_state = {
         "side": last_side,
         "ma": ma,
-        "price": last_close,
-        "ts": int(time.time()),
+        "price": last["c"],
+        "ts": now_ts,
+        "last_push_ts": state.get("last_push_ts", 0),
+        "last_confirm_push_ts": state.get("last_confirm_push_ts", 0),
+        "pending_confirm": pending,
     }
 
+    # 首次运行：只建基准，不推送
+    if last_recorded_side is None:
+        new_state["pending_confirm"] = None
+        save_state(bar, new_state)
+        print(f"[{bar}] 首次运行，记录基准 side={last_side} (ma={ma:.2f}, price={last['c']})")
+        return
+
+    now_str = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---- 1) 确认信号判定：这一根是否确认了上一根的穿越（整根不触及 MA83）----
+    confirmed_dir = None
+    if pending and pending == last_side:
+        if pending == 1 and last["l"] > ma:
+            confirmed_dir = "上穿"
+        elif pending == -1 and last["h"] < ma:
+            confirmed_dir = "下穿"
+
+    if confirmed_dir:
+        new_state["pending_confirm"] = None
+        diff_pct = (last["c"] - ma) / ma * 100
+        text = (
+            f"⭐【MA83 确认信号 · 重点】\n"
+            f"{INST_ID} {bar} 线 {confirmed_dir} 已确认\n"
+            f"确认K线整根未触及 MA({MA_PERIOD})\n"
+            f"开{last['o']:.2f} 高{last['h']:.2f} 低{last['l']:.2f} 收{last['c']:.2f}\n"
+            f"MA{MA_PERIOD}: {ma:,.2f}\n"
+            f"偏离: {diff_pct:+.3f}%\n"
+            f"时间: {now_str}"
+        )
+        if can_push(state, "last_confirm_push_ts", now_ts):
+            print(f"[{bar}] ⭐ 确认信号：{confirmed_dir}，重点推送 ...")
+            if push_wecom(text):
+                new_state["last_confirm_push_ts"] = now_ts
+        else:
+            print(f"[{bar}] ⭐ 确认信号：{confirmed_dir}，但免打扰/间隔内，跳过")
+    elif pending:
+        # 有待确认但这一根没确认成功（或方向已变），视为确认失败，清除
+        new_state["pending_confirm"] = None
+        print(f"[{bar}] 待确认未成立(pending={pending}, last_side={last_side})，清除")
+
+    # ---- 2) 穿越判定：这一根是否发生新的穿越 ----
+    crossed = prev_side != last_side and last_side != 0
     if crossed:
         direction = "上穿" if last_side == 1 else "下穿"
-        diff_pct = (last_close - ma) / ma * 100
-
-        # 免打扰检查：免打扰时间内不推送，但状态照常记录
-        if in_quiet_hours():
-            new_state["last_push_ts"] = state.get("last_push_ts", 0)
-            save_state(bar, new_state)
-            print(f"[{bar}] 穿越但处于免打扰时间(00:00-07:00)，跳过推送")
-            return
-
-        # 1 小时去重：距上次推送不足间隔则跳过
-        now_ts = int(time.time())
-        last_push = state.get("last_push_ts", 0)
-        if last_push and (now_ts - last_push) < MIN_PUSH_INTERVAL:
-            new_state["last_push_ts"] = last_push
-            save_state(bar, new_state)
-            print(f"[{bar}] 穿越但距上次推送不足 1 小时，跳过推送")
-            return
-
-        now = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
+        diff_pct = (last["c"] - ma) / ma * 100
+        # 记录待确认方向，由下一根已收线 K 线确认
+        new_state["pending_confirm"] = last_side
         text = (
             f"【BTC MA83 提醒】\n"
             f"{INST_ID} {bar} 线 {direction} MA({MA_PERIOD})\n"
-            f"当前价: {last_close:,.2f}\n"
+            f"当前价: {last['c']:,.2f}\n"
             f"MA{MA_PERIOD}: {ma:,.2f}\n"
             f"偏离: {diff_pct:+.3f}%\n"
-            f"时间: {now}"
+            f"时间: {now_str}\n"
+            f"（等待下一根收线确认）"
         )
-        print(f"[{bar}] ✅ 触发穿越：{direction}，推送中 ...")
-        if push_wecom(text):
-            new_state["last_push_ts"] = now_ts
+        if can_push(state, "last_push_ts", now_ts):
+            print(f"[{bar}] ✅ 触发穿越：{direction}，推送中 ...")
+            if push_wecom(text):
+                new_state["last_push_ts"] = now_ts
+        else:
+            print(f"[{bar}] ✅ 触发穿越：{direction}，但免打扰/间隔内，跳过")
     else:
-        new_state["last_push_ts"] = state.get("last_push_ts", 0)
         print(f"[{bar}] 未穿越 (prev={prev_side}, last={last_side}, ma={ma:.2f})")
 
     save_state(bar, new_state)
 
 
 def main() -> None:
-    print(f"=== BTC MA83 多周期检测开始 ({datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M:%S')}) ===")
+    print(f"=== BTC MA83 检测开始 ({datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M:%S')}) ===")
     source = get_data_source()
     for bar in BARS:
         try:
